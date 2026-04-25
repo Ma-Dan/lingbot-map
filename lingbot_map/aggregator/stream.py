@@ -17,6 +17,13 @@ from lingbot_map.layers.block import Block, FlashInferBlock, SDPABlock
 from lingbot_map.layers.rope import WanRotaryPosEmbed
 from lingbot_map.aggregator.base import AggregatorBase, slice_expand_and_flatten
 
+# Check FlashInfer availability
+try:
+    import flashinfer
+    FLASHINFER_AVAILABLE = True
+except ImportError:
+    FLASHINFER_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -89,8 +96,12 @@ class AggregatorStream(AggregatorBase):
         use_sdpa = kwargs.pop('use_sdpa', False)
 
         # Backend selection: SDPA (no extra deps) or FlashInfer (paged KV cache)
-        self.use_sdpa = use_sdpa
-        self.use_flashinfer = not use_sdpa  # FlashInfer is default unless SDPA requested
+        # Auto-fallback to SDPA if FlashInfer is not available
+        self.use_sdpa = use_sdpa or not FLASHINFER_AVAILABLE
+        self.use_flashinfer = not self.use_sdpa and FLASHINFER_AVAILABLE  # FlashInfer is default unless SDPA requested
+
+        if not FLASHINFER_AVAILABLE and not use_sdpa:
+            logger.warning("FlashInfer is not available, falling back to SDPA backend")
 
         # Call parent __init__
         super().__init__(**kwargs)
@@ -133,7 +144,7 @@ class AggregatorStream(AggregatorBase):
             for _ in range(depth)
         ])
 
-        # Global blocks: FlashInferBlock (default) or SDPABlock (fallback)
+        # Global blocks: SDPABlock (default for Mac/compatibility) or FlashInferBlock (if available)
         GlobalBlockCls = SDPABlock if self.use_sdpa else FlashInferBlock
         self.global_blocks = nn.ModuleList([
             GlobalBlockCls(
