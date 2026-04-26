@@ -301,15 +301,14 @@ class CausalAttention(nn.Module):
             # Note: k from cache is already RoPE-applied, no need to apply again
 
             if self.fused_attn:
-                # Use mask-based SDPA to ensure same kernel as batch mode
-                # The causal constraint is enforced by KV cache contents, not by mask
-                mask = torch.ones(B, 1, q.shape[2], k.shape[2], dtype=torch.bool, device=q.device)
+                # No mask needed: KV cache already enforces causal constraint.
+                # Passing an all-True mask is equivalent to no mask, and avoids
+                # creating small bool tensors that violate MPS's 288-byte minimum.
                 x = F.scaled_dot_product_attention(
                     q,
                     k,
                     v,
                     dropout_p=self.attn_drop.p if self.training else 0.0,
-                    attn_mask=mask,
                 )
 
         if self.gate_proj is not None:

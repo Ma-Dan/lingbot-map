@@ -436,7 +436,15 @@ class CameraBlock(nn.Module):
                 x = x + ffn_residual_func(x)
             return x
 
-        mask_block = self._prepare_blockwise_causal_attn_mask(
+        # Skip mask creation when using KV cache: CausalAttention ignores block_mask
+        # in that path. Building the mask unconditionally creates tiny tensors on MPS
+        # (frame_indices = arange(0,1) = 1 element = 8 bytes < 288 byte minimum) and
+        # runs create_mask via flex_attention for every block on every frame, which is
+        # pure overhead (16 wasted calls per streaming frame).
+        if kv_cache is not None:
+            mask_block = None
+        else:
+            mask_block = self._prepare_blockwise_causal_attn_mask(
                 device=x.device, num_frames=num_frames, frame_seqlen=frame_seqlen, num_frame_per_block=num_frame_per_block)
 
 

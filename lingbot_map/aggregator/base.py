@@ -437,8 +437,12 @@ class AggregatorBase(nn.Module, ABC):
         # Add offset for patch tokens (skip special tokens at pos=0)
         if self.patch_start_idx > 0:
             pos = pos + 1
-            pos_special = torch.zeros(B * S, self.patch_start_idx, 2, dtype=pos.dtype, device=device)
-            pos = torch.cat([pos_special, pos], dim=1)
+            # Create on CPU to avoid MPS 288-byte minimum buffer restriction on small tensors
+            pos_special = torch.zeros(B * S, self.patch_start_idx, 2, dtype=pos.dtype)
+            if device.type == "mps":
+                pos = torch.cat([pos_special, pos.cpu()], dim=1).to(device)
+            else:
+                pos = torch.cat([pos_special.to(device), pos], dim=1)
 
         return pos
 

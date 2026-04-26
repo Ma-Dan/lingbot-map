@@ -46,18 +46,19 @@ def make_sincos_pos_embed(embed_dim: int, pos: torch.Tensor, omega_0: float = 10
     """
     assert embed_dim % 2 == 0
     device = pos.device
-    omega = torch.arange(embed_dim // 2, dtype=torch.float32 if device.type == "mps" else torch.double, device=device)
+    # Compute all intermediates on CPU to avoid MPS 288-byte minimum buffer restriction
+    omega = torch.arange(embed_dim // 2, dtype=torch.float32)  # CPU
     omega /= embed_dim / 2.0
     omega = 1.0 / omega_0**omega  # (D/2,)
 
-    pos = pos.reshape(-1)  # (M,)
-    out = torch.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
+    pos_cpu = pos.reshape(-1).cpu().float()  # (M,) on CPU
+    out = torch.einsum("m,d->md", pos_cpu, omega)  # (M, D/2), outer product
 
     emb_sin = torch.sin(out)  # (M, D/2)
     emb_cos = torch.cos(out)  # (M, D/2)
 
     emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
-    return emb.float()
+    return emb.float().to(device)  # move large result to device
 
 
 # Inspired by https://github.com/microsoft/moge
@@ -98,12 +99,12 @@ def create_uv_grid(
     top_y = -span_y * (height - 1) / height
     bottom_y = span_y * (height - 1) / height
 
-    # Generate 1D coordinates
-    x_coords = torch.linspace(left_x, right_x, steps=width, dtype=dtype, device=device)
-    y_coords = torch.linspace(top_y, bottom_y, steps=height, dtype=dtype, device=device)
+    # Generate 1D coordinates on CPU to avoid MPS 288-byte minimum buffer restriction
+    x_coords = torch.linspace(left_x, right_x, steps=width, dtype=dtype)
+    y_coords = torch.linspace(top_y, bottom_y, steps=height, dtype=dtype)
 
     # Create 2D meshgrid (width x height) and stack into UV
     uu, vv = torch.meshgrid(x_coords, y_coords, indexing="xy")
     uv_grid = torch.stack((uu, vv), dim=-1)
 
-    return uv_grid
+    return uv_grid.to(device) if device is not None else uv_grid

@@ -412,7 +412,8 @@ class GCTStream(GCTBase):
         scale_images = images[:, :scale_frames]
         # No-op unless hot modules were compiled with mode="reduce-overhead";
         # required then to reset CUDA-graph step state between replays.
-        torch.compiler.cudagraph_mark_step_begin()
+        if next(iter(self.parameters())).device.type == "cuda":
+            torch.compiler.cudagraph_mark_step_begin()
         scale_output = self.forward(
             scale_images,
             num_frame_for_scale=scale_frames,
@@ -447,7 +448,8 @@ class GCTStream(GCTBase):
             if not is_keyframe:
                 self._set_skip_append(True)
 
-            torch.compiler.cudagraph_mark_step_begin()
+            if next(iter(self.parameters())).device.type == "cuda":
+                torch.compiler.cudagraph_mark_step_begin()
             frame_output = self.forward(
                 frame_image,
                 num_frame_for_scale=scale_frames,  # Keep same for scale token logic

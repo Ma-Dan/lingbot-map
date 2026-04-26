@@ -28,6 +28,10 @@ import time
 # pre-reserving fixed-size blocks.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# MPS fallback: route ops that fail on Metal (e.g. tensors < 288 bytes) to CPU silently.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+import contextlib
 import cv2
 import numpy as np
 import torch
@@ -162,7 +166,14 @@ def compile_model(model):
         b.attn.proj = torch.compile(b.attn.proj, mode="reduce-overhead")
 
 
-def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype, passes=1):
+def _autocast(device, dtype):
+    """Return an autocast context for CUDA; no-op on MPS/CPU (float32)."""
+    if device.type == "cuda":
+        return torch.amp.autocast("cuda", dtype=dtype)
+    return contextlib.nullcontext()
+
+
+def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype, device, passes=1):
     """Drive `clean_kv_cache → Phase 1 → N streaming forwards` `passes` times.
 
     Warmup inputs are sliced from the already-preprocessed `images` tensor, so their
@@ -175,8 +186,9 @@ def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype, passes=1)
 
     for _ in range(passes):
         model.clean_kv_cache()
-        torch.compiler.cudagraph_mark_step_begin()
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+        if device.type == "cuda":
+            torch.compiler.cudagraph_mark_step_begin()
+        with torch.no_grad(), _autocast(device, dtype):
             model.forward(
                 warm_scale,
                 num_frame_for_scale=scale_frames,
@@ -184,8 +196,9 @@ def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype, passes=1)
                 causal_inference=True,
             )
         for i in range(warm_stream_n):
-            torch.compiler.cudagraph_mark_step_begin()
-            with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+            if device.type == "cuda":
+                torch.compiler.cudagraph_mark_step_begin()
+            with torch.no_grad(), _autocast(device, dtype):
                 model.forward(
                     warm_stream[:, i:i + 1],
                     num_frame_for_scale=scale_frames,
@@ -194,6 +207,8 @@ def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype, passes=1)
                 )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+    elif torch.backends.mps.is_available():
+        torch.mps.synchronize()
     # Wipe warmup KV so real inference_streaming starts clean (it also calls
     # clean_kv_cache internally, but this is defensive + makes intent obvious).
     model.clean_kv_cache()
@@ -252,6 +267,8 @@ def postprocess(predictions, images):
     images_cpu = images.to("cpu", non_blocking=True)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+    elif torch.backends.mps.is_available():
+        torch.mps.synchronize()
 
     return predictions, images_cpu
 
@@ -358,7 +375,11 @@ def main():
     assert args.image_folder or args.video_path, \
         "Provide --image_folder or --video_path"
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
 
     # ── Load images & model ──────────────────────────────────────────────────
     t0 = time.time()
@@ -383,7 +404,9 @@ def main():
     model = load_model(args, device)
     print(f"Total load time: {time.time() - t0:.1f}s")
 
-    # Pick inference dtype; autocast still runs for the ops that need fp32 (e.g. LayerNorm).
+    # Pick inference dtype. float16 on MPS is problematic: autocast materialises float16
+    # copies of small parameters (q_norm/k_norm weight/bias are [head_dim=64] = 128 bytes),
+    # crashing MPS's 288-byte minimum buffer requirement. Use float32 everywhere except CUDA.
     if torch.cuda.is_available():
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     else:
@@ -409,7 +432,6 @@ def main():
             f"alloc={torch.cuda.memory_allocated()/1e9:.2f} GB, "
             f"reserved={torch.cuda.memory_reserved()/1e9:.2f} GB"
         )
-
     if args.keyframe_interval is None:
         if args.mode == "streaming" and num_frames > 320:
             args.keyframe_interval = (num_frames + 319) // 320
@@ -441,7 +463,7 @@ def main():
             warm_stream_n = min(10, max(1, num_frames - scale_for_warm))
             print(f"Warmup eager (scale + {warm_stream_n} streaming)...")
             t_warm = time.time()
-            _warm_streaming(model, images, scale_for_warm, warm_stream_n, dtype, passes=1)
+            _warm_streaming(model, images, scale_for_warm, warm_stream_n, dtype, device, passes=1)
             print(f"  eager warmup: {time.time() - t_warm:.1f}s")
 
             print("Compiling hot modules...")
@@ -452,7 +474,7 @@ def main():
             # real inference will see. See gct_profile.py:302-306 for rationale.
             print("Warmup compiled (3x dress rehearsal)...")
             t_warm = time.time()
-            _warm_streaming(model, images, scale_for_warm, warm_stream_n, dtype, passes=3)
+            _warm_streaming(model, images, scale_for_warm, warm_stream_n, dtype, device, passes=3)
             print(f"  compiled warmup: {time.time() - t_warm:.1f}s")
 
     # ── Inference ────────────────────────────────────────────────────────────
@@ -461,7 +483,7 @@ def main():
 
     output_device = torch.device("cpu") if args.offload_to_cpu else None
 
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+    with torch.no_grad(), _autocast(device, dtype):
         if args.mode == "streaming":
             predictions = model.inference_streaming(
                 images,

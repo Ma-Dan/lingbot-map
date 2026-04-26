@@ -255,11 +255,19 @@ class DPTHead(nn.Module):
         """
         patch_w = x.shape[-1]
         patch_h = x.shape[-2]
-        pos_embed = create_uv_grid(patch_w, patch_h, aspect_ratio=W / H, dtype=x.dtype, device=x.device)
-        pos_embed = position_grid_to_embed(pos_embed, x.shape[1])
-        pos_embed = pos_embed * ratio
-        pos_embed = pos_embed.permute(2, 0, 1)[None].expand(x.shape[0], -1, -1, -1)
-        return x + pos_embed
+        # Cache pos_embed by (patch_w, patch_h, W/H ratio, dtype, device) to avoid recomputing
+        # create_uv_grid + position_grid_to_embed on every inference step
+        cache_key = (patch_w, patch_h, W / H, x.shape[1], x.dtype, x.device)
+        if not hasattr(self, '_pos_embed_cache'):
+            self._pos_embed_cache = {}
+        if cache_key not in self._pos_embed_cache:
+            pos_embed = create_uv_grid(patch_w, patch_h, aspect_ratio=W / H, dtype=x.dtype, device=x.device)
+            pos_embed = position_grid_to_embed(pos_embed, x.shape[1])
+            pos_embed = pos_embed * ratio
+            pos_embed = pos_embed.permute(2, 0, 1)[None]
+            self._pos_embed_cache[cache_key] = pos_embed
+        pos_embed = self._pos_embed_cache[cache_key]
+        return x + pos_embed.expand(x.shape[0], -1, -1, -1)
 
     def scratch_forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """

@@ -36,7 +36,7 @@ class PositionGetter:
 
     def __init__(self):
         """Initializes the position generator with an empty cache."""
-        self.position_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.position_cache: Dict[Tuple, torch.Tensor] = {}
 
     def __call__(self, batch_size: int, height: int, width: int, device: torch.device) -> torch.Tensor:
         """Generates spatial positions for a batch of patches.
@@ -51,13 +51,17 @@ class PositionGetter:
             Tensor of shape (batch_size, height*width, 2) containing y,x coordinates
             for each position in the grid, repeated for each batch item.
         """
-        if (height, width) not in self.position_cache:
-            y_coords = torch.arange(height, device=device)
-            x_coords = torch.arange(width, device=device)
+        # Cache keyed by (height, width, device) to avoid repeated CPU→device transfers
+        cache_key = (height, width, device)
+        if cache_key not in self.position_cache:
+            # Compute intermediates on CPU to avoid MPS 288-byte minimum buffer restriction;
+            # final tensor [H*W, 2] is always large enough to live on device
+            y_coords = torch.arange(height)
+            x_coords = torch.arange(width)
             positions = torch.cartesian_prod(y_coords, x_coords)
-            self.position_cache[height, width] = positions
+            self.position_cache[cache_key] = positions.to(device)
 
-        cached_positions = self.position_cache[height, width]
+        cached_positions = self.position_cache[cache_key]
         return cached_positions.view(1, height * width, 2).expand(batch_size, -1, -1).clone()
 
 
@@ -101,20 +105,20 @@ class RotaryPositionEmbedding2D(nn.Module):
         """
         cache_key = (dim, seq_len, device, dtype)
         if cache_key not in self.frequency_cache:
-            # Compute frequency bands
-            exponents = torch.arange(0, dim, 2, device=device).float() / dim
+            # Compute all intermediates on CPU to avoid MPS 288-byte minimum buffer restriction
+            exponents = torch.arange(0, dim, 2).float() / dim
             inv_freq = 1.0 / (self.base_frequency**exponents)
-
-            # Generate position-dependent frequencies
-            positions = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+            positions = torch.arange(seq_len, dtype=inv_freq.dtype)
             angles = torch.einsum("i,j->ij", positions, inv_freq)
-
-            # Compute and cache frequency components
             angles = angles.to(dtype)
             angles = torch.cat((angles, angles), dim=-1)
             cos_components = angles.cos().to(dtype)
             sin_components = angles.sin().to(dtype)
-            self.frequency_cache[cache_key] = (cos_components, sin_components)
+            # Final tensors are [seq_len, dim] — large enough for MPS
+            self.frequency_cache[cache_key] = (
+                cos_components.to(device),
+                sin_components.to(device),
+            )
 
         return self.frequency_cache[cache_key]
 
@@ -261,11 +265,8 @@ def get_1d_rotary_pos_embed(
         freqs_sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1).float()  # [S, D]
         return freqs_cos, freqs_sin
     else:
-        # 方式3：复数形式（用于lumina等模型）
-        # 使用欧拉公式：e^(iθ) = cos(θ) + i*sin(θ)
-        # torch.polar(r, θ) 返回 r * e^(iθ)，这里r=1，所以就是 e^(i*freqs)
-        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64: [S, D/2]
-        return freqs_cis
+        # 方式3：返回实数角度（MPS不支持complex，在apply_rotary_emb中做实数旋转）
+        return freqs  # real: [S, D/2]
 
 
 class WanRotaryPosEmbed(nn.Module):
@@ -319,7 +320,7 @@ class WanRotaryPosEmbed(nn.Module):
             # 每个维度独立调用1D RoPE
             # 返回复数形式的频率: [max_seq_len, dim//2]
             freq = get_1d_rotary_pos_embed(
-                dim, max_seq_len, theta, use_real=False, repeat_interleave_real=False, freqs_dtype=torch.float64
+                dim, max_seq_len, theta, use_real=False, repeat_interleave_real=False, freqs_dtype=torch.float32
             )
             freqs.append(freq)
         # 将三个维度的频率在最后一维拼接: [max_seq_len, (t_dim + h_dim + w_dim)//2]
@@ -353,8 +354,8 @@ class WanRotaryPosEmbed(nn.Module):
         - Causal模式：f_end不为None，使用[f_start, f_end)范围的帧，ppf会被重新计算
         """
 
-        # 步骤1：将预计算的频率移到目标设备，并分割成三个维度
-        self.freqs = self.freqs.to(device)
+        # 步骤1：分割预计算的频率（保持在CPU以避免MPS 288字节最小缓冲区限制）
+        # freqs stays on CPU; apply_rotary_emb handles the device transfer when safe
         # 获取实际的维度分配
         if hasattr(self, 'fhw_dim') and self.fhw_dim is not None:
             t_dim, h_dim, w_dim = self.fhw_dim
@@ -414,61 +415,50 @@ class WanRotaryPosEmbed(nn.Module):
             # Flatten to get final shape: (ppf * (patch_start_idx + pph * ppw), dim)
             freqs = freqs.reshape(ppf * (patch_start_idx + pph * ppw), -1)
             freqs = freqs.unsqueeze(0).unsqueeze(0)  # (1, 1, ppf * (patch_start_idx + pph * ppw), dim) 添加batch和head维度
+            # Move to device only when result is large enough (MPS requires >= 288 bytes)
+            if freqs.numel() * freqs.element_size() >= 288:
+                freqs = freqs.to(device)
             return freqs
-        
+
         # 如果没有特殊token（patch_start_idx == 0），只处理图像patches
         # 所有patches位于 (f, 0:pph, 0:ppw)
         freqs_f = freqs[0][frame_slice].reshape(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)  # (ppf, pph, ppw, dim_f) 帧维度
         freqs_h = freqs[1][:pph].reshape(1, pph, 1, -1).expand(ppf, pph, ppw, -1)  # (ppf, pph, ppw, dim_h) 高度从0开始
         freqs_w = freqs[2][:ppw].reshape(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)  # (ppf, pph, ppw, dim_w) 宽度从0开始
         freqs = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(1, 1, ppf * pph * ppw, -1)  # (1, 1, ppf * pph * ppw, dim)
+        # Move to device only when result is large enough (MPS requires >= 288 bytes)
+        if freqs.numel() * freqs.element_size() >= 288:
+            freqs = freqs.to(device)
         return freqs
     
 def apply_rotary_emb(x, freqs):
     """
     应用旋转位置编码到输入特征
-    
-    核心思想：使用复数乘法实现特征旋转，保持相对位置信息
-    
-    数学原理：
-    对于2D向量 [x1, x2]，旋转θ角度可以表示为复数乘法：
-    (x1 + ix2) * e^(iθ) = (x1 + ix2) * (cos(θ) + i*sin(θ))
-                        = (x1*cos(θ) - x2*sin(θ)) + i*(x1*sin(θ) + x2*cos(θ))
-    
-    这等价于旋转矩阵：
-    [cos(θ)  -sin(θ)] [x1]
-    [sin(θ)   cos(θ)] [x2]
-    
-    参数：
-    - x: 输入特征 [batch, heads, seq_len, head_dim]
-    - freqs: 旋转频率（复数） [1, 1, seq_len, head_dim//2]
-    
-    返回：
-    - x_out: 旋转后的特征 [batch, heads, seq_len, head_dim]
-    
-    实现步骤：
-    1. 将x的每两个连续特征看作一个复数 (real, imag)
-    2. 与预计算的复数频率 e^(iθ) 相乘
-    3. 转回实数表示
     """
-    # 步骤1：reshape成 [..., head_dim//2, 2] 形式，最后一维表示(real, imag)
-    # 例如：[b, h, seq, 64] -> [b, h, seq, 32, 2]
-    x_reshaped = x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
-    
-    # 步骤2：转换为复数表示 [b, h, seq, 32]
-    # 每个元素是 real + imag*i
-    x_complex = torch.view_as_complex(x_reshaped)
-    
-    # 步骤3：复数乘法实现旋转
-    # x_complex * freqs 相当于将每对特征旋转θ角度
-    # freqs已经是 e^(iθ) = cos(θ) + i*sin(θ) 的形式
-    x_rotated = x_complex * freqs
-    
-    # 步骤4：转回实数表示 [b, h, seq, 32, 2]
-    x_real = torch.view_as_real(x_rotated)
-    
-    # 步骤5：展平最后两维 [b, h, seq, 64]
-    x_out = x_real.flatten(3)
-    
-    # 步骤6：转回原始数据类型
-    return x_out.to(x.dtype)
+    # freqs: real angles [..., head_dim//2]; use real-valued rotation to avoid complex ops (MPS).
+    # (x_r + i*x_i) * (cos + i*sin) = (x_r*cos - x_i*sin) + i*(x_r*sin + x_i*cos)
+    #
+    # freqs may be on CPU when it was too small for MPS (< 288 bytes).
+    # If freqs is large enough to move to device, do that; otherwise fall back to CPU computation.
+    original_device = x.device
+    if freqs.device != original_device:
+        freqs_bytes = freqs.numel() * freqs.element_size()
+        if freqs_bytes >= 288:
+            freqs = freqs.to(original_device)
+        else:
+            # freqs too small for MPS; compute on CPU and move result back
+            x = x.cpu()
+
+    x_float = x.float()
+    x_reshaped = x_float.reshape(*x.shape[:-1], -1, 2)
+    x_r = x_reshaped[..., 0]
+    x_i = x_reshaped[..., 1]
+
+    cos = freqs.cos()
+    sin = freqs.sin()
+
+    out_r = x_r * cos - x_i * sin
+    out_i = x_r * sin + x_i * cos
+
+    x_out = torch.stack([out_r, out_i], dim=-1).flatten(-2)
+    return x_out.to(dtype=x.dtype, device=original_device)
