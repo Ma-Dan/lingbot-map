@@ -28,7 +28,8 @@ import time
 # pre-reserving fixed-size blocks.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-# MPS fallback: route ops that fail on Metal (e.g. tensors < 288 bytes) to CPU silently.
+# MPS fallback: route ops that fail on Metal to CPU silently (only relevant when
+# using --device mps).
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import contextlib
@@ -370,16 +371,26 @@ def main():
                         help="Save sky mask visualizations (original | mask | overlay) to this directory")
     parser.add_argument("--export_preprocessed", type=str, default=None,
                         help="Export stride-sampled, resized/cropped images to this folder")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Force device: 'cpu', 'cuda', or 'mps'. Default: cuda if available, else cpu.")
 
     args = parser.parse_args()
     assert args.image_folder or args.video_path, \
         "Provide --image_folder or --video_path"
 
-    device = torch.device(
-        "cuda" if torch.cuda.is_available()
-        else "mps" if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    # Device selection: CUDA > CPU > MPS.
+    # MPS is intentionally skipped by default: Metal's allocator never returns
+    # freed tensors to the OS, so KV-cache growth causes peak usage 8× higher
+    # than CPU (~24 GB vs ~3 GB on a 20-frame run).  Apple Silicon CPUs also run
+    # streaming inference (batch_size=1) faster than MPS due to lower per-op
+    # dispatch overhead.  Use --device mps to opt in if experimenting.
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    print(f"Device: {device}")
 
     # ── Load images & model ──────────────────────────────────────────────────
     t0 = time.time()
