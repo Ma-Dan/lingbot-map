@@ -34,7 +34,15 @@ LingBot-Map has focused on:
 
 # 📰 News
 
+- **2026-04-27** — 🚀 **LingBot-Map accelerated**. Pull the latest `main` and run `python demo.py --compile ...` or `python gct_profile.py --backend flashinfer --dtype bf16 --compile` to verify on your hardware.
 - **2026-04-24** — Fixed a FlashInfer KV cache bug where `--keyframe_interval > 1` silently cached non-keyframes. **You should now see better pose and reconstruction quality when running with more than 320 frames**.
+---
+
+# 📋 TODO
+
+- [ ] Release evaluation benchmark
+- [ ] Release demo scripts
+
 ---
 
 # ⚙️ Quick Start
@@ -87,7 +95,7 @@ pip install -e ".[vis]"
 | :--- | :--- | :--- | :--- |
 | lingbot-map-long | [robbyant/lingbot-map](https://huggingface.co/robbyant/lingbot-map) | [Robbyant/lingbot-map](https://www.modelscope.cn/models/Robbyant/lingbot-map) | Better suited for long sequences and large scale scenes (Recommend). |
 | lingbot-map | [robbyant/lingbot-map](https://huggingface.co/robbyant/lingbot-map) | [Robbyant/lingbot-map](https://www.modelscope.cn/models/Robbyant/lingbot-map) | Balanced checkpoint — trade off all-around performance across short and long sequences. |
-| lingbot-map-stage1 | [robbyant/lingbot-map](https://huggingface.co/robbyant/lingbot-map) | [Robbyant/lingbot-map](https://www.modelscope.cn/models/Robbyant/lingbot-map) | Stage-1 training checkpoint of lingbot-map — can be loaded into the VGGT model for bidirectional inference. |
+| lingbot-map-stage1 | [robbyant/lingbot-map](https://huggingface.co/robbyant/lingbot-map) | [Robbyant/lingbot-map](https://www.modelscope.cn/models/Robbyant/lingbot-map) | Stage-1 training checkpoint of lingbot-map — can be loaded into the VGGT model for bidirectional inference (c2w). |
 
 > 🚧 **Coming soon:** we're training an stronger model that supports longer sequences — stay tuned.
 
@@ -99,9 +107,9 @@ Run `demo.py` for interactive 3D visualization via a browser-based [viser](https
 
 We provide four example scenes in `example/` that you can run out of the box:
 ```bash
-# Church scene
+# courthouse scene
 python demo.py --model_path /path/to/lingbot-map-long.pt \
-    --image_folder example/church --mask_sky
+    --image_folder example/courthouse --mask_sky
 ```
 
 
